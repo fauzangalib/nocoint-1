@@ -45,6 +45,7 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -56,6 +57,10 @@ UA = "rpow2-headless/1.0 (+https://github.com/)"
 MIN_GAP = 0.5            # minimum seconds between HTTP calls
 MAX_BACKOFF = 60.0
 BASE_UNITS_PER_RPOW = 1_000_000_000  # from /ledger
+
+# Path to optional native C solver (compiled from solver.c). If present, it is
+# used instead of the Python solver -- typically 20-50x faster per core.
+NATIVE_SOLVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver")
 
 log = logging.getLogger("rpow2")
 
@@ -136,6 +141,9 @@ def _worker(prefix: bytes, bits: int, start: int, stride: int,
 
 
 def solve_parallel(prefix: bytes, bits: int, workers: int) -> tuple[int, int]:
+    """Solve using the native binary if available (way faster), else Python."""
+    if os.path.isfile(NATIVE_SOLVER) and os.access(NATIVE_SOLVER, os.X_OK):
+        return _solve_native(prefix, bits, workers)
     if workers <= 1:
         res = solve(prefix, bits)
         assert res is not None
@@ -161,6 +169,43 @@ def solve_parallel(prefix: bytes, bits: int, workers: int) -> tuple[int, int]:
     if isinstance(first, tuple) and len(first) == 2 and isinstance(first[0], int):
         return first  # (nonce, hashes_in_that_worker)
     raise RuntimeError(f"worker error: {first!r}")
+
+
+def _solve_native(prefix: bytes, bits: int, workers: int) -> tuple[int, int]:
+    """Spawn N copies of the C solver, partitioning the u64 nonce space by
+    (start=i, stride=N). First one to print a result wins; the rest are SIGTERM'd."""
+    hex_prefix = prefix.hex()
+    procs: list[subprocess.Popen] = []
+    for i in range(max(1, workers)):
+        p = subprocess.Popen(
+            [NATIVE_SOLVER, hex_prefix, str(bits), str(i), str(max(1, workers))],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+    try:
+        while True:
+            alive = [p for p in procs if p.poll() is None]
+            done = [p for p in procs if p.poll() is not None]
+            for p in done:
+                if p.returncode == 0 and p.stdout is not None:
+                    out = p.stdout.read().decode().split()
+                    if len(out) >= 2:
+                        nonce = int(out[0]); hashes = int(out[1])
+                        return nonce, hashes
+            if not alive:
+                # everyone exited nonzero -- shouldn't happen for a valid challenge
+                raise RuntimeError("all native solver processes exited without a solution")
+            time.sleep(0.05)
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+        for p in procs:
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
 
 
 # ---------- HTTP client -------------------------------------------------
@@ -279,14 +324,20 @@ def mine_one(c: Client, workers: int) -> dict | None:
     prefix_hex = ch["nonce_prefix"]
     bits = int(ch["difficulty_bits"])
     prefix = bytes.fromhex(prefix_hex)
-    log.info("challenge %s: bits=%d prefix=%s", cid[:8], bits, prefix_hex)
+    backend = "C" if (os.path.isfile(NATIVE_SOLVER) and os.access(NATIVE_SOLVER, os.X_OK)) else "py"
+    log.info("challenge %s: bits=%d prefix=%s backend=%s workers=%d",
+             cid[:8], bits, prefix_hex, backend, workers)
 
     t0 = time.monotonic()
     nonce, hashes = solve_parallel(prefix, bits, workers)
     dt = time.monotonic() - t0
     rate = hashes / dt if dt > 0 else 0.0
-    log.info("solved in %.2fs, nonce=%d, ~%.2f MH/s (this worker)",
-             dt, nonce, rate / 1e6)
+    # For native backend, `hashes` is the count within the winning worker.
+    # Aggregate rate across N workers is ~N*rate. For Python, workers run at
+    # stride=N so the winning worker's rate is also per-core.
+    aggregate = rate * max(1, workers) / 1e6
+    log.info("solved in %.2fs, nonce=%d, ~%.2f MH/s per-core (~%.2f MH/s aggregate)",
+             dt, nonce, rate / 1e6, aggregate)
 
     # sanity check before we bother the server
     buf = prefix + nonce.to_bytes(8, "little")

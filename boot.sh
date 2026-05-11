@@ -48,6 +48,16 @@ for p in python git tmux; do ensure_pkg "$p"; done
 # on Debian/Ubuntu it's `python3`, not `python`
 if ! need python3 && need python; then ln -sf "$(command -v python)" /usr/local/bin/python3 2>/dev/null || true; fi
 if ! need python3; then ensure_pkg python3; fi
+# C compiler for the optional fast native solver. Termux has `clang`, Debian
+# has `gcc` via `build-essential`, Alpine uses `build-base`. Failure is
+# non-fatal -- Python fallback still works.
+if ! need cc && ! need gcc && ! need clang; then
+  case "$PM" in
+    pkg)     pkg install -y clang || true ;;
+    apt-get) (apt-get install -y build-essential 2>/dev/null || sudo apt-get install -y build-essential) || true ;;
+    apk)     apk add --no-cache build-base || true ;;
+  esac
+fi
 
 # ---- keep screen on (Termux only) -----------------------------------------
 if need termux-wake-lock; then
@@ -68,6 +78,24 @@ fi
 
 # ---- self-test -------------------------------------------------------------
 ( cd "$REPO_DIR" && python3 rpow2.py --selftest )
+
+# ---- compile native solver (optional, 20-50x speedup) ---------------------
+CC=""
+if need cc;    then CC="cc"
+elif need gcc; then CC="gcc"
+elif need clang; then CC="clang"
+fi
+if [[ -n "$CC" && -f "$REPO_DIR/solver.c" ]]; then
+  echo "[boot] compiling native solver with $CC..."
+  if "$CC" -O3 -o "$REPO_DIR/solver" "$REPO_DIR/solver.c" 2>&1; then
+    echo "[boot] native solver ready at $REPO_DIR/solver"
+  else
+    echo "[boot] native compile failed, falling back to Python solver"
+    rm -f "$REPO_DIR/solver"
+  fi
+else
+  echo "[boot] no C compiler found; using Python solver (slower)"
+fi
 
 # ---- work out worker count -------------------------------------------------
 CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
