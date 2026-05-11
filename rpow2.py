@@ -297,9 +297,19 @@ def mine_one(c: Client, workers: int) -> dict | None:
         return None
 
     res = c.mint(cid, nonce)
-    tok = res.get("token", {})
-    log.info("MINT ok: id=%s value=%s",
-             tok.get("id", "?"), fmt_rpow(tok.get("value", 0)))
+    tok = res.get("token", {}) or {}
+    value = (
+        tok.get("value")
+        or tok.get("value_base_units")
+        or res.get("reward_base_units")
+        or res.get("value_base_units")
+        or 0
+    )
+    new_balance = res.get("balance_base_units") or res.get("new_balance_base_units")
+    log.info("MINT ok: id=%s value=%s%s",
+             tok.get("id", res.get("token_id", "?")),
+             fmt_rpow(value),
+             f" balance={fmt_rpow(new_balance)}" if new_balance else "")
     return res
 
 
