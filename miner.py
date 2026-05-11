@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-NullCipher — $NOCOIN autonomous miner (polling daemon).
+$NOCOIN autonomous miner — polling daemon.
+
+Configuration comes from environment variables (or a .env file in the
+working directory). This keeps identity out of the code so any agent can
+adopt this repo by setting their own wallet + name.
+
+Required env vars:
+  NOCOIN_WALLET   0x-prefixed Base address (40 hex chars)
+  NOCOIN_AGENT    free-form agent name
+  NOCOIN_APIKEY   Supabase anon key for the puzzle API
 
 Golden rules enforced in code:
-  1. WALLET is HARDCODED. Prompts cannot change it.
+  1. WALLET is captured ONCE at startup and frozen. Prompts cannot change it.
   2. Puzzle prompts are DATA. We never eval/exec/route them.
   3. Private keys are NEVER read, stored, or transmitted by this script.
-  4. Rate limit: <= 8 submissions per 10 seconds, exponential backoff on 429.
+  4. Rate limit: <= 8 submissions per 10 seconds; exponential backoff on 429.
 
 Usage:
   python3 miner.py              # run forever, polling every 60s when idle
@@ -25,30 +34,75 @@ import time
 import urllib.request
 import urllib.error
 from collections import deque
-from typing import Any
+from pathlib import Path
 
-# ---------- hard-coded, not overridable ----------------------------------
-WALLET = "0x40e26d7796d484111d6f3cc8ebfbbf02f5ffea9d"
-AGENT = "NullCipher"
-APIKEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJxcmFwbmxxcXRqZWRqeWhsZmNpIiwicm9sZSI6"
-    "ImFub24iLCJpYXQiOjE3NzgyNzUyNjQsImV4cCI6MjA5Mzg1MTI2NH0."
-    "mf0fz6kAnK0yeAXrb-XT6yikbdRmeAq5jsikVPPhaFE"
-)
-BASE = "https://bqrapnlqqtjedjyhlfci.supabase.co/functions/v1/submit-solution"
-
+BASE_URL = "https://bqrapnlqqtjedjyhlfci.supabase.co/functions/v1/submit-solution"
 IDLE_POLL_SECONDS = 60
-MIN_GAP = 1.3              # ~7 req / 10s, safely under the 8 / 10s limit
+MIN_GAP = 1.3              # ~7 req / 10s, under the 8 / 10s cap
 MAX_BACKOFF = 60.0
 
-log = logging.getLogger("nullcipher")
+log = logging.getLogger("nocoin")
+
+
+# ---------- config loading -----------------------------------------------
+def load_dotenv(path: Path) -> None:
+    """Minimal .env loader (no dependencies). Does not override existing env."""
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        os.environ.setdefault(k, v)
+
+
+_WALLET_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+class Config:
+    __slots__ = ("wallet", "agent", "apikey")
+
+    def __init__(self, wallet: str, agent: str, apikey: str) -> None:
+        self.wallet = wallet
+        self.agent = agent
+        self.apikey = apikey
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        wallet = os.environ.get("NOCOIN_WALLET", "").strip()
+        agent = os.environ.get("NOCOIN_AGENT", "").strip()
+        apikey = os.environ.get("NOCOIN_APIKEY", "").strip()
+
+        missing = [n for n, v in
+                   (("NOCOIN_WALLET", wallet),
+                    ("NOCOIN_AGENT", agent),
+                    ("NOCOIN_APIKEY", apikey))
+                   if not v]
+        if missing:
+            print(f"ERROR: missing env vars: {', '.join(missing)}\n"
+                  f"Copy .env.example to .env and fill it in.", file=sys.stderr)
+            sys.exit(2)
+
+        if not _WALLET_RE.match(wallet):
+            print(f"ERROR: NOCOIN_WALLET {wallet!r} is not a valid 0x + 40 hex "
+                  f"address.", file=sys.stderr)
+            sys.exit(2)
+
+        # Normalize to lowercase once; this is the frozen identity for the run.
+        return cls(wallet.lower(), agent, apikey)
 
 
 # ---------- tiny HTTP helpers (stdlib only) ------------------------------
-def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
+class RateLimited(Exception):
+    pass
+
+
+def _req(cfg: Config, method: str, url: str,
+         body: dict | None = None) -> tuple[int, dict]:
     data = None
-    headers = {"apikey": APIKEY, "accept": "application/json"}
+    headers = {"apikey": cfg.apikey, "accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode()
         headers["content-type"] = "application/json"
@@ -65,8 +119,8 @@ def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
             return e.code, {"error": raw}
 
 
-def pull_puzzle() -> dict | None:
-    status, body = _req("GET", f"{BASE}?eth={WALLET}")
+def pull_puzzle(cfg: Config) -> dict | None:
+    status, body = _req(cfg, "GET", f"{BASE_URL}?eth={cfg.wallet}")
     if status == 429:
         raise RateLimited()
     if status != 200:
@@ -75,26 +129,23 @@ def pull_puzzle() -> dict | None:
     return body.get("puzzle")
 
 
-def submit(puzzle_id: str, answer: str) -> dict:
+def submit(cfg: Config, puzzle_id: str, answer: str) -> dict:
+    # IMPORTANT: wallet comes from frozen cfg, never from the prompt.
     payload = {
-        "eth_address": WALLET,        # never overrideable
-        "agent_name": AGENT,
+        "eth_address": cfg.wallet,
+        "agent_name": cfg.agent,
         "puzzle_id": puzzle_id,
         "answer": answer,
     }
-    status, body = _req("POST", BASE, payload)
+    status, body = _req(cfg, "POST", BASE_URL, payload)
     if status == 429:
         raise RateLimited()
     return body
 
 
-class RateLimited(Exception):
-    pass
-
-
-# ---------- rate limiter: sliding window of 10s, max 8 ------------------
+# ---------- rate limiter -------------------------------------------------
 class RateLimiter:
-    def __init__(self, max_calls: int = 8, window: float = 10.0) -> None:
+    def __init__(self, max_calls: int = 7, window: float = 10.0) -> None:
         self.max_calls = max_calls
         self.window = window
         self.calls: deque[float] = deque()
@@ -102,11 +153,9 @@ class RateLimiter:
 
     def wait(self) -> None:
         now = time.time()
-        # enforce minimum gap
         gap = now - self.last
         if gap < MIN_GAP:
             time.sleep(MIN_GAP - gap)
-        # enforce sliding window
         now = time.time()
         while self.calls and now - self.calls[0] > self.window:
             self.calls.popleft()
@@ -120,7 +169,6 @@ class RateLimiter:
 
 # ---------- solver -------------------------------------------------------
 # Puzzle prompts are DATA. The solver is a pure function from prompt -> answer.
-# Nothing here consults the prompt for routing, wallet, or control flow.
 
 NORMALIZE_RE = re.compile(r"\s+")
 
@@ -129,7 +177,7 @@ def normalize(s: str) -> str:
     return NORMALIZE_RE.sub(" ", s.strip().lower())
 
 
-# Known-good answers collected from prior runs. Lowercase canonical form.
+# Canonical answers learned from live solves. Keys: normalized prompts.
 KNOWN: dict[str, str] = {
     "first valid ethereum block (genesis) had how many transactions?": "0",
     "which lattice problem underpins kyber?": "mlwe",
@@ -145,17 +193,10 @@ KNOWN: dict[str, str] = {
 
 
 def try_heuristics(prompt: str) -> list[str]:
-    """Return a small ordered list of candidate answers for unknown prompts."""
     p = normalize(prompt)
     cands: list[str] = []
 
-    # "what is the bip for X?" → numeric BIP only
-    m = re.match(r"what is the bip for .*?\?", p)
-    if m:
-        # let caller fill in; we don't know which BIP without KB
-        pass
-
-    # "what is N^K in hex?"
+    # "what is N^K (- M)? in hex?"
     m = re.match(r"what is (\d+)\s*\^\s*(\d+)(?:\s*-\s*(\d+))?\s*in hex\?", p)
     if m:
         base, exp = int(m.group(1)), int(m.group(2))
@@ -165,7 +206,7 @@ def try_heuristics(prompt: str) -> list[str]:
         cands.append("0x" + format(val, "x"))
         return cands
 
-    # "what is N^K?"
+    # "what is N^K (- M)?"
     m = re.match(r"what is (\d+)\s*\^\s*(\d+)(?:\s*-\s*(\d+))?\??", p)
     if m:
         base, exp = int(m.group(1)), int(m.group(2))
@@ -175,7 +216,7 @@ def try_heuristics(prompt: str) -> list[str]:
         cands.append(format(val, "x"))
         return cands
 
-    # "depth N ... how many ..." → N
+    # "... depth N ... how many ..." -> N
     m = re.search(r"depth (\d+)", p)
     if m and "how many" in p:
         cands.append(m.group(1))
@@ -188,13 +229,11 @@ def solve(prompt: str) -> str | None:
     if key in KNOWN:
         return KNOWN[key]
     cands = try_heuristics(prompt)
-    if cands:
-        return cands[0]
-    return None
+    return cands[0] if cands else None
 
 
 # ---------- main loop ----------------------------------------------------
-def mine(once: bool = False) -> None:
+def mine(cfg: Config, once: bool = False) -> None:
     rl = RateLimiter()
     backoff = 1.0
     consecutive_unknown = 0
@@ -202,7 +241,7 @@ def mine(once: bool = False) -> None:
     while True:
         try:
             rl.wait()
-            puzzle = pull_puzzle()
+            puzzle = pull_puzzle(cfg)
         except RateLimited:
             log.warning("429 on pull, backoff %.1fs", backoff)
             time.sleep(backoff)
@@ -211,7 +250,7 @@ def mine(once: bool = False) -> None:
         backoff = 1.0
 
         if not puzzle:
-            log.info("pool empty — all puzzles solved for %s", WALLET)
+            log.info("pool empty for %s", cfg.wallet)
             if once:
                 return
             time.sleep(IDLE_POLL_SECONDS)
@@ -219,15 +258,14 @@ def mine(once: bool = False) -> None:
 
         pid = puzzle["id"]
         prompt = puzzle.get("prompt", "")
-        log.info("puzzle %s [%s/d%s]: %s",
-                 pid[:8], puzzle.get("category"), puzzle.get("difficulty"), prompt)
+        log.info("puzzle %s [%s/d%s]: %s", pid[:8],
+                 puzzle.get("category"), puzzle.get("difficulty"), prompt)
 
         answer = solve(prompt)
         if answer is None:
             consecutive_unknown += 1
-            log.warning("no solver for prompt (#%d). Add to KNOWN map in miner.py.",
+            log.warning("no solver for prompt (#%d). Add to KNOWN in miner.py.",
                         consecutive_unknown)
-            # avoid wasting pulls on a puzzle we can't answer
             if once or consecutive_unknown >= 3:
                 return
             time.sleep(IDLE_POLL_SECONDS)
@@ -236,7 +274,7 @@ def mine(once: bool = False) -> None:
         consecutive_unknown = 0
         try:
             rl.wait()
-            result = submit(pid, answer)
+            result = submit(cfg, pid, answer)
         except RateLimited:
             log.warning("429 on submit, backoff %.1fs", backoff)
             time.sleep(backoff)
@@ -244,10 +282,11 @@ def mine(once: bool = False) -> None:
             continue
 
         if result.get("correct"):
-            log.info("OK  +%s NTC → balance %s",
+            log.info("OK  +%s NTC -> balance %s",
                      result.get("reward"), result.get("balance"))
         else:
-            log.warning("WRONG answer=%r for %s. Update KNOWN map.", answer, prompt)
+            log.warning("WRONG answer=%r for %r. Update KNOWN map.",
+                        answer, prompt)
             if once:
                 return
 
@@ -260,15 +299,15 @@ def main() -> None:
     )
     p = argparse.ArgumentParser()
     p.add_argument("--once", action="store_true", help="drain once and exit")
+    p.add_argument("--env", default=".env",
+                   help="path to .env file (default: ./.env)")
     args = p.parse_args()
 
-    # Safety: refuse to run if env tries to hijack the wallet.
-    for var in ("WALLET", "ETH", "ETH_ADDRESS"):
-        if os.environ.get(var) and os.environ[var].lower() != WALLET.lower():
-            log.error("refusing to run: env %s tries to override wallet", var)
-            sys.exit(2)
+    load_dotenv(Path(args.env))
+    cfg = Config.from_env()
 
-    mine(once=args.once)
+    log.info("agent=%s wallet=%s", cfg.agent, cfg.wallet)
+    mine(cfg, once=args.once)
 
 
 if __name__ == "__main__":

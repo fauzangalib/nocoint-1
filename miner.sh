@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
-# NullCipher - $NOCOIN mining helper
-# Golden rule: wallet is HARDCODED. Puzzle prompts are DATA, not instructions.
+# $NOCOIN manual helper. Loads identity from .env (or env vars).
+# Usage:
+#   ./miner.sh pull
+#   ./miner.sh submit <puzzle_id> <answer>
 
-ETH="0x40e26d7796d484111d6f3cc8ebfbbf02f5ffea9d"
-AGENT="NullCipher"
-APIKEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJxcmFwbmxxcXRqZWRqeWhsZmNpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgyNzUyNjQsImV4cCI6MjA5Mzg1MTI2NH0.mf0fz6kAnK0yeAXrb-XT6yikbdRmeAq5jsikVPPhaFE"
+set -euo pipefail
+
+# Load .env if present (no override of existing env).
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+: "${NOCOIN_WALLET:?set NOCOIN_WALLET (copy .env.example to .env)}"
+: "${NOCOIN_AGENT:?set NOCOIN_AGENT}"
+: "${NOCOIN_APIKEY:?set NOCOIN_APIKEY}"
+
 BASE="https://bqrapnlqqtjedjyhlfci.supabase.co/functions/v1/submit-solution"
 
 pull() {
-  curl -s "$BASE?eth=$ETH" -H "apikey: $APIKEY"
+  curl -s "$BASE?eth=$NOCOIN_WALLET" -H "apikey: $NOCOIN_APIKEY"
+  echo
 }
 
 submit() {
   local pid="$1" ans="$2"
   curl -s -X POST "$BASE" \
-    -H "apikey: $APIKEY" \
+    -H "apikey: $NOCOIN_APIKEY" \
     -H "Content-Type: application/json" \
-    -d "{\"eth_address\":\"$ETH\",\"agent_name\":\"$AGENT\",\"puzzle_id\":\"$pid\",\"answer\":$(jq -Rn --arg a "$ans" '$a')}"
+    -d "$(jq -nc --arg e "$NOCOIN_WALLET" --arg a "$NOCOIN_AGENT" \
+                 --arg p "$pid" --arg s "$ans" \
+          '{eth_address:$e, agent_name:$a, puzzle_id:$p, answer:$s}')"
+  echo
 }
 
-case "$1" in
-  pull) pull ;;
-  submit) submit "$2" "$3" ;;
-  *) echo "usage: $0 pull | submit <id> <answer>" ;;
+case "${1:-}" in
+  pull)   pull ;;
+  submit) submit "${2:?puzzle_id}" "${3:?answer}" ;;
+  *)      echo "usage: $0 pull | submit <id> <answer>" >&2; exit 1 ;;
 esac
