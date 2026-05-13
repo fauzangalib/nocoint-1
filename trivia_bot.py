@@ -27,6 +27,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -174,11 +175,64 @@ def normalize(q: str) -> str:
     return re.sub(r"\s+", " ", q.strip().lower())
 
 
+def web_search_answer(question: str, choices: list[str]) -> int | None:
+    """Search DuckDuckGo for the answer. Returns choice_idx or None if unsure."""
+    try:
+        query = urllib.parse.quote_plus(question + " answer")
+        url   = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
+        req   = urllib.request.Request(url, headers={
+            "user-agent": "Mozilla/5.0 (compatible; trivia-bot/1.0)"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode())
+
+        # Combine AbstractText + Answer + RelatedTopics text for matching
+        text_blob = " ".join([
+            data.get("AbstractText", ""),
+            data.get("Answer", ""),
+            " ".join(t.get("Text", "") for t in data.get("RelatedTopics", [])
+                     if isinstance(t, dict)),
+        ]).lower()
+
+        if not text_blob.strip():
+            log.debug("search: no snippet for '%s'", question[:50])
+            return None
+
+        log.debug("search snippet: %s", text_blob[:200])
+
+        # Score each choice by how many of its words appear in the snippet
+        scores = []
+        for i, ch in enumerate(choices):
+            words  = [w for w in re.findall(r"[a-z0-9]+", ch.lower()) if len(w) > 2]
+            score  = sum(1 for w in words if w in text_blob)
+            # Bonus: exact phrase match
+            if ch.lower() in text_blob:
+                score += 5
+            scores.append((score, i))
+            log.debug("  [%d] %s → score=%d", i, ch, score)
+
+        best_score, best_idx = max(scores)
+        if best_score == 0:
+            log.debug("search: no match in snippet")
+            return None
+
+        log.info("search → [%d] %s (score=%d)", best_idx, choices[best_idx], best_score)
+        return best_idx
+
+    except Exception as e:
+        log.debug("search failed: %s", e)
+        return None
+
+
 def pick(question: str, choices: list[str]) -> int:
-    """Return best choice_idx using known answers → heuristics → fallback."""
+    """Return best choice_idx using:
+       1. Known answer dict (instant, no network)
+       2. Web search (DuckDuckGo API, fast & free)
+       3. Keyword heuristics
+       4. Fallback [0]
+    """
     nq = normalize(question)
 
-    # 1. Exact match
+    # 1. Exact known answer
     if nq in KNOWN:
         idx = KNOWN[nq]
         log.info("known [%d] %s", idx, choices[idx] if idx < len(choices) else "?")
@@ -190,40 +244,40 @@ def pick(question: str, choices: list[str]) -> int:
             log.info("partial-match [%d] %s", idx, choices[idx] if idx < len(choices) else "?")
             return idx
 
-    # 3. Keyword heuristics: scan choices for strong signals
+    # 3. Web search
+    log.info("searching web for: %s", question[:80])
+    found = web_search_answer(question, choices)
+    if found is not None:
+        return found
+
+    # 4. Keyword heuristics
     cl = [c.lower() for c in choices]
-    ql = nq
-
     heuristics = [
-        # (keyword in question, term in choice, priority)
-        ("hal finney",       ["hal finney", "finney"],          0),
-        ("satoshi",          ["satoshi nakamoto", "nakamoto"],   0),
-        ("sha-256",          ["sha-256", "sha256"],              0),
-        ("sha-1",            ["sha-1", "sha1"],                  0),
-        ("solana",           ["solana", "sol"],                  0),
-        ("proof of work",    ["proof of work", "pow"],           0),
-        ("21 million",       ["21 million", "21,000,000"],       0),
-        ("1 billion",        ["1,000,000,000", "1 billion"],     0),
-        ("reusable",         ["reusable proof", "rpow"],         0),
-        ("bitcoin",          ["bitcoin", "btc"],                 0),
-        ("ethereum",         ["ethereum", "eth"],                0),
-        ("merkle",           ["merkle"],                         0),
-        ("10 minutes",       ["10 minutes", "10 min"],           0),
-        ("2008",             ["2008"],                           0),
-        ("2009",             ["2009"],                           0),
-        ("100,000,000",      ["100,000,000", "100 million"],     0),
+        ("hal finney",   ["hal finney", "finney"]),
+        ("satoshi",      ["satoshi nakamoto", "nakamoto"]),
+        ("sha-256",      ["sha-256", "sha256"]),
+        ("sha-1",        ["sha-1", "sha1"]),
+        ("solana",       ["solana", "sol"]),
+        ("proof of work",["proof of work", "pow"]),
+        ("21 million",   ["21 million", "21,000,000"]),
+        ("1 billion",    ["1,000,000,000", "1 billion"]),
+        ("reusable",     ["reusable proof", "rpow"]),
+        ("bitcoin",      ["bitcoin", "btc"]),
+        ("ethereum",     ["ethereum", "eth"]),
+        ("10 minutes",   ["10 minutes", "10 min"]),
+        ("2008",         ["2008"]),
+        ("2009",         ["2009"]),
     ]
-
-    for keyword, terms, _ in heuristics:
-        if keyword in ql:
+    for keyword, terms in heuristics:
+        if keyword in nq:
             for term in terms:
                 for i, c in enumerate(cl):
                     if term in c:
                         log.info("heuristic '%s' → [%d] %s", term, i, choices[i])
                         return i
 
-    # 4. Fallback
-    log.warning("unknown Q, guessing [0]. Add to KNOWN dict if wrong.")
+    # 5. Fallback
+    log.warning("unknown Q, guessing [0]")
     log.warning("Q: %s", question)
     for i, ch in enumerate(choices):
         log.warning("  [%d] %s", i, ch)
