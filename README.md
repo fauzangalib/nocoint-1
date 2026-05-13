@@ -141,3 +141,74 @@ Manual, via curl helper:
 5. **Offline-verifiable.** `--selftest` cross-checks two independent
    implementations of the trailing-zero-bit rule over 2000 random digests, plus
    end-to-end solves at 8/12/16/20 bits.
+
+
+
+---
+
+## rpow2 Trivia bot (`trivia_bot.js`)
+
+PvP trivia di [trivia.rpow2.com](https://trivia.rpow2.com) — kamu vs orang
+lain, taruhan RPOW, yang jawab benar menang jackpot.
+
+### Cara pakai (browser console, paling reliable)
+
+1. Buka <https://trivia.rpow2.com/> di browser, pastikan sudah login.
+2. Daftar di <https://console.groq.com> → bikin API key (gratis).
+3. Edit `trivia_bot.js`:
+   - `myEmail`   → email akun rpow2 kamu
+   - `GROQ_KEY`  → API key dari Groq
+4. F12 → Console → paste seluruh isi file → Enter.
+5. Bot auto: scan lobby → pilih lawan → jawab soal → klaim reward.
+6. Stop: ketik `stopBot()` di console.
+
+### Answer engine
+
+Urutan pipeline:
+
+1. **KNOWN dict** (instant, no network)
+   Hardcoded jawaban untuk soal yang sering muncul. Tiap kali bot kalah,
+   keyword soal otomatis di-learn ke KNOWN dict.
+
+2. **Groq AI** (`llama-3.3-70b-versatile`)
+   ~100ms response. Gratis 14400 req/hari di tier free Groq.
+   Ganti `compound-beta` (web search built-in) untuk akurasi lebih tinggi.
+
+3. **Fallback [0]** kalau AI timeout / error.
+
+### Kenapa browser console, bukan Python script
+
+Trivia API pakai Cloudflare yang block IP datacenter (VPS, cloud sandbox,
+bahkan Kiro environment). Browser fetch pakai `credentials:"include"` →
+pakai cookie browser asli → Cloudflare lolos.
+
+Python version (kalau dibutuhkan untuk server dengan IP residential) ada
+juga, tapi cookie `cf_clearance` expired ~30 menit jadi kurang praktis.
+
+### Update KNOWN saat bot salah
+
+Bot tetap jalan, tinggal tambah di console:
+
+```javascript
+KNOWN["kata_kunci_soal"] = INDEX_BENAR;
+```
+
+Contoh yang pernah salah & sekarang dihardcode:
+
+| soal                          | jawaban benar        |
+| ----------------------------- | -------------------- |
+| Whistler codename             | Windows XP           |
+| Kuwait islands                | 9                    |
+| Coulrophobia                  | Clowns               |
+| Artist yang cut off ear       | Van Gogh             |
+| Warframe fish eats natives    | Mawfish              |
+| Rebadged car paling sering    | Isuzu Trooper        |
+| Intel HD after Broadwell      | HD 500               |
+| Zeptometres in 1 femtometre   | 1,000,000            |
+
+### Safety rules
+
+1. **Never send, wrap, bind wallet.** Bot only reads `/api/trivia/*` + `/me`.
+2. **Cookie via browser only.** `credentials:"include"` = browser fetch pakai
+   cookie asli tanpa expose ke script.
+3. **MIN_BET filter** bisa di-set untuk skip lawan dengan bet terlalu besar.
