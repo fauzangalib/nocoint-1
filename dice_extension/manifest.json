@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Halstavern Dice Bot",
+  "version": "1.0",
+  "description": "Auto-bet dice on halstavern.net using RPOW from rpow2.com",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://halstavern.net/*",
+    "https://rpow2.com/*",
+    "https://api.rpow2.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Dice Bot"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://halstavern.net/*"],
+      "js": ["content_hal.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://rpow2.com/*"],
+      "js": ["content_rpow.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
