@@ -3,7 +3,7 @@
   "name": "Halstavern Dice Bot",
   "version": "1.0",
   "description": "Auto-bet dice on halstavern.net using RPOW from rpow2.com",
-  "permissions": ["storage", "alarms", "cookies"],
+  "permissions": ["storage", "alarms", "cookies", "scripting", "tabs"],
   "host_permissions": [
     "https://halstavern.net/*",
     "https://rpow2.com/*",

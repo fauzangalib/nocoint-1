@@ -1,7 +1,6 @@
-// Background service worker - cookie-based polling (no content script dependency)
+// Background service worker - navigate to fundingUrl + auto-click Send
 const BET = 100000000; // 0.1 RPOW
 const HAL = "https://halstavern.net";
-const RPOW_API = "https://api.rpow2.com";
 let running = false, wins = 0, losses = 0;
 
 // Keep service worker alive via alarm
@@ -25,21 +24,12 @@ function rndSeed() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Get cookie string for a domain using chrome.cookies API
-async function getCookies(domain) {
+// Fetch via halstavern tab content script (for placing bets)
+async function halFetchTab(method, path, body) {
   return new Promise(resolve => {
-    chrome.cookies.getAll({ domain }, cookies => {
-      resolve(cookies.map(c => c.name+"="+c.value).join("; "));
-    });
-  });
-}
-
-// Fetch via content script (for bet + send — needs tab cookie context)
-async function fetchViaTab(tabUrl, type, method, path, body) {
-  return new Promise(resolve => {
-    chrome.tabs.query({ url: tabUrl }, tabs => {
-      if (!tabs.length) { resolve({ ok: false, error: "no tab: " + tabUrl }); return; }
-      chrome.tabs.sendMessage(tabs[0].id, { type, method, path, body }, r => {
+    chrome.tabs.query({ url: "https://halstavern.net/*" }, tabs => {
+      if (!tabs.length) { resolve({ ok: false, error: "no halstavern tab open!" }); return; }
+      chrome.tabs.sendMessage(tabs[0].id, { type: "HAL_FETCH", method, path, body }, r => {
         if (chrome.runtime.lastError) { resolve({ ok: false, error: chrome.runtime.lastError.message }); return; }
         resolve(r || { ok: false });
       });
@@ -47,55 +37,86 @@ async function fetchViaTab(tabUrl, type, method, path, body) {
   });
 }
 
-// Place bet via halstavern tab content script
-async function halFetchTab(method, path, body) {
-  return fetchViaTab("https://halstavern.net/*", "HAL_FETCH", method, path, body);
-}
-
-// Send RPOW via rpow2 tab content script
-async function rpowFetchTab(method, path, body) {
-  return fetchViaTab("https://rpow2.com/*", "RPOW_FETCH", method, path, body);
-}
-
-// Poll bet status DIRECTLY from background using chrome.cookies (no tab needed!)
-async function halFetchBg(method, path, body) {
-  try {
-    const cookies = await getCookies("halstavern.net");
-    const url = path.startsWith("http") ? path : HAL + path;
-    const r = await fetch(url, {
-      method,
-      headers: {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "cookie": cookies,
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      },
-      body: body ? JSON.stringify(body) : undefined
+// Get fundingUrl from halstavern bet page
+async function getFundingUrl(betId) {
+  return new Promise(resolve => {
+    chrome.tabs.query({ url: "https://halstavern.net/*" }, tabs => {
+      if (!tabs.length) { resolve(null); return; }
+      chrome.tabs.sendMessage(tabs[0].id, {
+        type: "HAL_FETCH", method: "GET",
+        path: "/bets/"+betId+"/__data.json?x-sveltekit-invalidated=01"
+      }, r => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        const fu = r && r.data && r.data.nodes && r.data.nodes[1] &&
+                   r.data.nodes[1].data && r.data.nodes[1].data[11];
+        resolve(fu || null);
+      });
     });
-    const t = await r.text();
-    try { return { ok: r.ok, status: r.status, data: JSON.parse(t) }; }
-    catch(e) { return { ok: false, data: { raw: t.slice(0,200) } }; }
-  } catch(e) {
-    return { ok: false, error: e.message };
-  }
+  });
+}
+
+// Navigate rpow2 tab to fundingUrl then auto-click Send button
+async function payViaFundingUrl(fundingUrl) {
+  return new Promise(resolve => {
+    chrome.tabs.query({ url: "https://rpow2.com/*" }, tabs => {
+      if (!tabs.length) { resolve(false); return; }
+      const tabId = tabs[0].id;
+
+      // Navigate to fundingUrl (memo already in URL hash)
+      chrome.tabs.update(tabId, { url: fundingUrl }, () => {
+        // Poll for send button (handles auto-redirect to /#/ledger)
+        let attempts = 0;
+        const maxAttempts = 15;
+        const interval = setInterval(() => {
+          attempts++;
+          chrome.scripting.executeScript({
+            target: { tabId },
+            func: (expectedHash) => {
+              // Make sure we're on the right page (send page)
+              if (!location.hash.includes("/send")) {
+                // Still on wrong page, navigate again
+                location.href = expectedHash;
+                return { status: "navigating" };
+              }
+              // Find and click [ SEND ] button
+              const btns = Array.from(document.querySelectorAll("button,a"));
+              const sendBtn = btns.find(b =>
+                b.textContent.includes("SEND") ||
+                b.textContent.includes("send") ||
+                b.className.includes("active")
+              );
+              if (sendBtn) {
+                sendBtn.click();
+                return { status: "clicked", text: sendBtn.textContent.trim() };
+              }
+              return { status: "waiting", btns: btns.map(b=>b.textContent.trim()).slice(0,5) };
+            },
+            args: [fundingUrl]
+          }, result => {
+            if (chrome.runtime.lastError) return; // tab still loading
+            const r = result && result[0] && result[0].result;
+            console.log("[DiceBot] click attempt", attempts, r);
+            if (r && r.status === "clicked") {
+              clearInterval(interval);
+              resolve(true);
+            } else if (attempts >= maxAttempts) {
+              clearInterval(interval);
+              resolve(false);
+            }
+          });
+        }, 1000); // check every 1s
+      });
+    });
+  });
 }
 
 async function trackBet(betId) {
   for (let i = 0; i < 60; i++) {
     await sleep(3000);
     try {
-      // Try via tab first (needs tab open)
       const poll = await halFetchTab("GET", "/api/bets/"+betId);
       const b = poll && poll.data && poll.data.bet;
-      if (!b) {
-        console.log("[DiceBot] poll "+i+": empty (tab may have navigated, retrying)");
-        // Force re-inject content script by reloading the halstavern tab
-        chrome.tabs.query({ url: "https://halstavern.net/*" }, tabs => {
-          if (tabs.length) chrome.tabs.reload(tabs[0].id);
-        });
-        await sleep(2000);
-        continue;
-      }
+      if (!b) { console.log("[DiceBot] poll "+i+": empty"); continue; }
       console.log("[DiceBot] poll "+i+": "+b.status);
       if (b.status !== "pending") {
         const payout = parseInt(b.payout_base_units || 0);
@@ -120,6 +141,7 @@ async function runBot() {
 
   while (running) {
     try {
+      // 1. Place bet
       const betRes = await halFetchTab("POST", "/api/bets", {
         game_slug: "dice",
         stake_base_units: String(BET),
@@ -136,25 +158,28 @@ async function runBot() {
       }
 
       const betId = betRes.data.bet.id;
-      const memo = betRes.data.bet.memo;
       console.log("[DiceBot] Bet:", betId.slice(0,8));
 
-      const sendRes = await rpowFetchTab("POST", "/send", {
-        recipient_email: "halstavern56@gmail.com",
-        amount_base_units: String(BET),
-        idempotency_key: memo
-      });
-      const tid = sendRes.data && sendRes.data.transfer_id;
-      console.log("[DiceBot] Send:", sendRes.ok ? "OK "+tid : "FAIL "+sendRes.error);
+      // 2. Get fundingUrl (has memo in URL hash)
+      const fundingUrl = await getFundingUrl(betId);
+      if (!fundingUrl) {
+        console.log("[DiceBot] No fundingUrl, skip");
+        continue;
+      }
+      console.log("[DiceBot] fundingUrl:", fundingUrl.slice(0,80));
 
-      // Fire-and-forget track
+      // 3. Navigate rpow2 tab to fundingUrl + auto-click Send
+      const paid = await payViaFundingUrl(fundingUrl);
+      console.log("[DiceBot] Payment clicked:", paid);
+
+      // 4. Track bet result (fire-and-forget)
       trackBet(betId);
 
     } catch(e) {
       console.error("[DiceBot] Error:", e.message);
       await sleep(3000);
     }
-    await sleep(300);
+    await sleep(500);
   }
   console.log("[DiceBot] Stopped. W="+wins+" L="+losses);
 }
