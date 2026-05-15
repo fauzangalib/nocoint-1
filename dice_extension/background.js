@@ -66,14 +66,20 @@ async function runBot() {
       });
       console.log("[DiceBot] Send:", sendRes.ok ? "OK" : "FAIL", sendRes.data);
 
-      // 4. Poll hasil
+      // 4. Poll hasil - dengan retry kalau tab navigate
       let result = null;
       for (let i = 0; i < 60 && running; i++) {
-        await sleep(2000);
-        const poll = await halFetch("GET", `/api/bets/${betId}`);
-        const b = poll?.data?.bet;
-        if (!b) continue;
-        if (b.status !== "pending") { result = b; break; }
+        await sleep(3000);
+        try {
+          const poll = await halFetch("GET", `/api/bets/${betId}`);
+          const b = poll?.data?.bet;
+          if (!b) { console.log("[DiceBot] poll empty, retry..."); continue; }
+          console.log("[DiceBot] poll status:", b.status);
+          if (b.status !== "pending") { result = b; break; }
+        } catch(e) {
+          console.log("[DiceBot] poll error:", e.message, "retry...");
+          await sleep(2000);
+        }
       }
 
       if (result) {
@@ -92,7 +98,7 @@ async function runBot() {
       console.error("[DiceBot] Error:", e.message);
       await sleep(3000);
     }
-    await sleep(500);
+    await sleep(300);
   }
   console.log(`[DiceBot] Stopped. W=${wins} L=${losses}`);
 }
