@@ -62,7 +62,7 @@ async function runBot() {
         game_slug: "dice",
         stake_base_units: String(BET),
         client_seed: rndSeed(),
-        params: { target: 9, direction: "over" }
+        params: { target: 96, direction: "under" }
       });
 
       if (!betRes.ok || !betRes.data?.ok) {
