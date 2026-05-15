@@ -1,6 +1,20 @@
-// Background service worker
+// Background service worker - with keep-alive alarm
 const BET = 100000000; // 0.1 RPOW
 let running = false, wins = 0, losses = 0;
+
+// Keep service worker alive
+chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "keepAlive") {
+    chrome.storage.local.get(["running","wins","losses"], d => {
+      if (d.running && !running) {
+        running = true; wins = d.wins||0; losses = d.losses||0;
+        console.log("[DiceBot] Resumed after SW restart");
+        runBot();
+      }
+    });
+  }
+});
 
 function rndSeed() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -103,8 +117,16 @@ async function runBot() {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-  if (msg.type === "START") { if (!running) runBot(); reply({ running: true, wins, losses }); }
-  if (msg.type === "STOP")  { running = false; reply({ running: false, wins, losses }); }
+  if (msg.type === "START") {
+    if (!running) runBot();
+    chrome.storage.local.set({ running: true, wins, losses });
+    reply({ running: true, wins, losses });
+  }
+  if (msg.type === "STOP") {
+    running = false;
+    chrome.storage.local.set({ running: false });
+    reply({ running: false, wins, losses });
+  }
   if (msg.type === "STATUS") { reply({ running, wins, losses }); }
   return true;
 });
