@@ -1,8 +1,10 @@
-// Background service worker - with keep-alive alarm
+// Background service worker - cookie-based polling (no content script dependency)
 const BET = 100000000; // 0.1 RPOW
+const HAL = "https://halstavern.net";
+const RPOW_API = "https://api.rpow2.com";
 let running = false, wins = 0, losses = 0;
 
-// Keep service worker alive
+// Keep service worker alive via alarm
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepAlive") {
@@ -23,55 +25,91 @@ function rndSeed() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function halFetch(method, path, body) {
+// Get cookie string for a domain using chrome.cookies API
+async function getCookies(domain) {
   return new Promise(resolve => {
-    chrome.tabs.query({ url: "https://halstavern.net/*" }, tabs => {
-      if (!tabs.length) { resolve({ ok: false, error: "no halstavern tab open!" }); return; }
-      chrome.tabs.sendMessage(tabs[0].id, { type: "HAL_FETCH", method, path, body }, r => resolve(r || { ok: false }));
+    chrome.cookies.getAll({ domain }, cookies => {
+      resolve(cookies.map(c => c.name+"="+c.value).join("; "));
     });
   });
 }
 
-async function rpowFetch(method, path, body) {
-  return new Promise(resolve => {
-    chrome.tabs.query({ url: "https://rpow2.com/*" }, tabs => {
-      if (!tabs.length) { resolve({ ok: false, error: "no rpow2.com tab open!" }); return; }
-      chrome.tabs.sendMessage(tabs[0].id, { type: "RPOW_FETCH", method, path, body }, r => resolve(r || { ok: false }));
+// Fetch halstavern directly from background (no content script!)
+async function halFetch(method, path, body) {
+  try {
+    const cookies = await getCookies("halstavern.net");
+    const url = path.startsWith("http") ? path : HAL + path;
+    const r = await fetch(url, {
+      method,
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "cookie": cookies
+      },
+      body: body ? JSON.stringify(body) : undefined
     });
-  });
+    const t = await r.text();
+    try { return { ok: r.ok, status: r.status, data: JSON.parse(t) }; }
+    catch(e) { return { ok: false, data: { raw: t.slice(0,200) } }; }
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// Fetch rpow2 API directly from background (no content script!)
+async function rpowFetch(method, path, body) {
+  try {
+    const cookies = await getCookies("rpow2.com");
+    const r = await fetch(RPOW_API + path, {
+      method,
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "cookie": cookies,
+        "origin": "https://rpow2.com",
+        "referer": "https://rpow2.com/"
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const t = await r.text();
+    try { return { ok: r.ok, status: r.status, data: JSON.parse(t) }; }
+    catch(e) { return { ok: false, data: { raw: t.slice(0,200) } }; }
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 async function trackBet(betId) {
   for (let i = 0; i < 60; i++) {
     await sleep(3000);
     try {
-      const poll = await halFetch("GET", `/api/bets/${betId}`);
-      const b = poll?.data?.bet;
+      const poll = await halFetch("GET", "/api/bets/"+betId);
+      const b = poll && poll.data && poll.data.bet;
       if (!b) continue;
+      console.log("[DiceBot] poll", i, b.status);
       if (b.status !== "pending") {
         const payout = parseInt(b.payout_base_units || 0);
         if (payout > BET) {
           wins++;
-          console.log(`[DiceBot] WIN +${(payout-BET)/1e9} RPOW (W=${wins} L=${losses})`);
+          console.log("[DiceBot] WIN +"+(payout-BET)/1e9+" RPOW (W="+wins+" L="+losses+")");
         } else {
           losses++;
-          console.log(`[DiceBot] LOSS (W=${wins} L=${losses})`);
+          console.log("[DiceBot] LOSS (W="+wins+" L="+losses+")");
         }
         chrome.storage.local.set({ wins, losses, running });
         return;
       }
-    } catch(e) { /* retry silently */ }
+    } catch(e) { /* retry */ }
   }
-  console.log(`[DiceBot] bet ${betId.slice(0,8)} timeout`);
+  console.log("[DiceBot] bet "+betId.slice(0,8)+" timeout");
 }
 
 async function runBot() {
   running = true;
-  console.log("[DiceBot] Starting - over 9, bet=0.1 RPOW");
+  console.log("[DiceBot] Starting - under 96, bet=0.1 RPOW");
 
   while (running) {
     try {
-      // 1. Place bet
       const betRes = await halFetch("POST", "/api/bets", {
         game_slug: "dice",
         stake_base_units: String(BET),
@@ -79,8 +117,8 @@ async function runBot() {
         params: { target: 96, direction: "under" }
       });
 
-      if (!betRes.ok || !betRes.data?.ok) {
-        const reason = betRes.data?.reason || betRes.error || "unknown";
+      if (!betRes.ok || !betRes.data || !betRes.data.ok) {
+        const reason = (betRes.data && betRes.data.reason) || betRes.error || "unknown";
         if (reason.includes("house can cover up to 0")) { await sleep(500); continue; }
         console.log("[DiceBot] Bet fail:", reason);
         await sleep(3000);
@@ -89,22 +127,17 @@ async function runBot() {
 
       const betId = betRes.data.bet.id;
       const memo = betRes.data.bet.memo;
-      console.log("[DiceBot] Bet:", betId.slice(0,8), "memo:", memo);
+      console.log("[DiceBot] Bet:", betId.slice(0,8));
 
-      // 2. Ambil house email dari halstavern
-      const pageRes = await halFetch("GET", `/bets/${betId}/__data.json?x-sveltekit-invalidated=01`);
-      const houseEmail = pageRes?.data?.nodes?.[1]?.data?.[12] || "halstavern56@gmail.com";
-      console.log("[DiceBot] House:", houseEmail);
-
-      // 3. Kirim RPOW langsung via rpow2 content script (no popup!)
       const sendRes = await rpowFetch("POST", "/send", {
-        recipient_email: houseEmail,
+        recipient_email: "halstavern56@gmail.com",
         amount_base_units: String(BET),
         idempotency_key: memo
       });
-      console.log("[DiceBot] Send:", sendRes.ok ? "OK" : "FAIL", sendRes.data);
+      const tid = sendRes.data && sendRes.data.transfer_id;
+      console.log("[DiceBot] Send:", sendRes.ok ? "OK "+tid : "FAIL "+sendRes.error);
 
-      // 4. Track bet di background (fire-and-forget, tidak block loop utama)
+      // Fire-and-forget track
       trackBet(betId);
 
     } catch(e) {
@@ -113,13 +146,13 @@ async function runBot() {
     }
     await sleep(300);
   }
-  console.log(`[DiceBot] Stopped. W=${wins} L=${losses}`);
+  console.log("[DiceBot] Stopped. W="+wins+" L="+losses);
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.type === "START") {
     if (!running) runBot();
-    chrome.storage.local.set({ running: true, wins, losses });
+    chrome.storage.local.set({ running: true });
     reply({ running: true, wins, losses });
   }
   if (msg.type === "STOP") {
