@@ -27,6 +27,30 @@ async function rpowFetch(method, path, body) {
   });
 }
 
+async function trackBet(betId) {
+  for (let i = 0; i < 60; i++) {
+    await sleep(3000);
+    try {
+      const poll = await halFetch("GET", `/api/bets/${betId}`);
+      const b = poll?.data?.bet;
+      if (!b) continue;
+      if (b.status !== "pending") {
+        const payout = parseInt(b.payout_base_units || 0);
+        if (payout > BET) {
+          wins++;
+          console.log(`[DiceBot] WIN +${(payout-BET)/1e9} RPOW (W=${wins} L=${losses})`);
+        } else {
+          losses++;
+          console.log(`[DiceBot] LOSS (W=${wins} L=${losses})`);
+        }
+        chrome.storage.local.set({ wins, losses, running });
+        return;
+      }
+    } catch(e) { /* retry silently */ }
+  }
+  console.log(`[DiceBot] bet ${betId.slice(0,8)} timeout`);
+}
+
 async function runBot() {
   running = true;
   console.log("[DiceBot] Starting - over 9, bet=0.1 RPOW");
@@ -66,33 +90,8 @@ async function runBot() {
       });
       console.log("[DiceBot] Send:", sendRes.ok ? "OK" : "FAIL", sendRes.data);
 
-      // 4. Poll hasil - dengan retry kalau tab navigate
-      let result = null;
-      for (let i = 0; i < 60 && running; i++) {
-        await sleep(3000);
-        try {
-          const poll = await halFetch("GET", `/api/bets/${betId}`);
-          const b = poll?.data?.bet;
-          if (!b) { console.log("[DiceBot] poll empty, retry..."); continue; }
-          console.log("[DiceBot] poll status:", b.status);
-          if (b.status !== "pending") { result = b; break; }
-        } catch(e) {
-          console.log("[DiceBot] poll error:", e.message, "retry...");
-          await sleep(2000);
-        }
-      }
-
-      if (result) {
-        const payout = parseInt(result.payout_base_units || 0);
-        if (payout > BET) {
-          wins++;
-          console.log(`[DiceBot] WIN +${(payout-BET)/1e9} RPOW (W=${wins} L=${losses})`);
-        } else {
-          losses++;
-          console.log(`[DiceBot] LOSS (W=${wins} L=${losses})`);
-        }
-        chrome.storage.local.set({ wins, losses, running });
-      }
+      // 4. Track bet di background (fire-and-forget, tidak block loop utama)
+      trackBet(betId);
 
     } catch(e) {
       console.error("[DiceBot] Error:", e.message);
