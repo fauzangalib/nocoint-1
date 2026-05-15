@@ -84,10 +84,18 @@ async function trackBet(betId) {
   for (let i = 0; i < 60; i++) {
     await sleep(3000);
     try {
-      // Poll directly from background (no content script dependency!)
-      const poll = await halFetchBg("GET", "/api/bets/"+betId);
+      // Try via tab first (needs tab open)
+      const poll = await halFetchTab("GET", "/api/bets/"+betId);
       const b = poll && poll.data && poll.data.bet;
-      if (!b) { console.log("[DiceBot] poll "+i+": empty, retry"); continue; }
+      if (!b) {
+        console.log("[DiceBot] poll "+i+": empty (tab may have navigated, retrying)");
+        // Force re-inject content script by reloading the halstavern tab
+        chrome.tabs.query({ url: "https://halstavern.net/*" }, tabs => {
+          if (tabs.length) chrome.tabs.reload(tabs[0].id);
+        });
+        await sleep(2000);
+        continue;
+      }
       console.log("[DiceBot] poll "+i+": "+b.status);
       if (b.status !== "pending") {
         const payout = parseInt(b.payout_base_units || 0);
